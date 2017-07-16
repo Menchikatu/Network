@@ -43,10 +43,9 @@ namespace Network
 
             _ReceiveData callback = TCPClientCallback;
 
-            TCPCilent client = new TCPCilent(ip, int.Parse(port),1024,callback);
-
-            Thread pingThread = new Thread(PingProc);
-            pingThread.Start();
+            PingClient client = new PingClient(ip, int.Parse(port),1024,callback,1000);
+            client.PingStart(); 
+            client.ReceiveStart();
 
             while (true)
             {
@@ -61,13 +60,12 @@ namespace Network
             client.Close();
         }
 
-        public static void PingProc()
-        {
-
-        }
-
         public static void TCPClientCallback(byte[] data,TcpClient client)
         {
+            BinaryFormatter formatter = new BinaryFormatter();
+            MemoryStream ms = new MemoryStream();
+            ms.Write(data, 0, data.Length);
+            PingMsg formatter.Deserialize(ms);
             string str = Encoding.UTF8.GetString(data);
             Console.WriteLine("受信 : "+str);
         }
@@ -406,14 +404,19 @@ namespace Network
             private int ReadTimeOut = -1;
             private int WriteTimeOut = -1;
 
-            public TCPCilent(string ip,int port,int buffer,_ReceiveData ReceiveCallback)
+            public TCPCilent(string ip,int port,int buffer,_ReceiveData ReceiveCallback):this(ip,port,buffer)
             {
-
+                RecvProc.ReceiveDataCallback = ReceiveCallback;
+            }
+            
+            protected TCPCilent(string ip,int port,int buffer)
+            {
                 TcpClient client;
                 try
                 {
                     client = new TcpClient(ip, port);
-                }catch(SocketException e)
+                }
+                catch (SocketException e)
                 {
                     Console.WriteLine("接続に失敗しました");
                     Console.WriteLine("ErrorCode : " + e.ErrorCode);
@@ -421,18 +424,18 @@ namespace Network
                 }
                 Console.WriteLine("接続完了");
                 RecvProc = new ReceiveProc(ReadTimeOut, WriteTimeOut, client, 1024);
-                RecvProc.ReceiveDataCallback = ReceiveCallback;
             }
-            public bool Send(byte[] data)
+
+            public virtual bool Send(byte[] data)
             {
                 NetMsg msg = new NetMsg(data);
                 return RecvProc.Send(msg);
             }
-            public void ReceiveStart()
+            public virtual void ReceiveStart()
             {
                 RecvProc.ReceiveStart();
             }
-            public void ReceiveEnd()
+            public virtual void ReceiveEnd()
             {
                 RecvProc.ReceiveEnd();
             }
@@ -440,17 +443,74 @@ namespace Network
             {
                 RecvProc.Close();
             }
+
+            protected void setReceveCallback(_ReceiveData callback)
+            {
+                RecvProc.ReceiveDataCallback = callback;
+            }
+
+            protected void addReceiveCallback(_ReceiveData callback)
+            {
+                RecvProc.ReceiveDataCallback += callback;
+            }
+
+            protected ReceiveProc getReceiveProc()
+            {
+                return RecvProc;
+            }
         }
 
+        /*
         public class PingClient : TCPCilent
         {
-            private int PingRate;
+            private int PingInterval;
             private _ReceiveData ReceiveCallback;
-            public PingClient(string ip,int port,int buffer,_ReceiveData ReceiveCallback,int pingRate) : base(ip, port, buffer, ReceiveCallback)
-            {
+            private Timer PingTimer;
+            private byte[] dummy;
+            private BinaryFormatter formatter;
 
-                PingRate = pingRate; 
+            public PingClient(string ip,int port,int buffer,_ReceiveData ReceiveCallback,int pingInterval) : base(ip, port, buffer)
+            {
+                setReceveCallback(PingCallback);
+                PingInterval = pingInterval;
+                this.ReceiveCallback = ReceiveCallback;
+                dummy = new byte[0];
+                formatter = new BinaryFormatter();
             }
+            public void PingStart()
+            {
+                PingTimer = new Timer(new TimerCallback(PingSendCallback));
+                PingTimer.Change(0, PingInterval);
+            }
+            public void PingStop()
+            {
+                PingTimer.Dispose();
+            }
+            public override bool Send(byte[] data)
+            {
+                PingMsg ping = new PingMsg(data);
+                NetMsg msg = new NetMsg(ping.getBytes());
+                return getReceiveProc().Send(msg);
+            }
+
+            public override void ReceiveEnd()
+            {
+                PingTimer.Dispose();
+                PingTimer = null;
+                base.ReceiveEnd();
+            }
+
+            private void PingSendCallback(object args)
+            {
+                PingMsg ping = new PingMsg(dummy);
+                using (MemoryStream ms = new MemoryStream())
+                {
+                    formatter.Serialize(ms, ping);
+                    NetMsg msg = new NetMsg(ms.ToArray());
+                    Send(msg.getBytes());
+                }
+            }
+
             private void PingCallback(byte[] data,TcpClient remote)
             {
                 BinaryFormatter formatter = new BinaryFormatter();
@@ -474,17 +534,83 @@ namespace Network
                 }
             }
 
+            [System.Serializable]
             class PingMsg
             {
                 private byte[] data;
+                public PingMsg(byte[] data)
+                {
+                    this.data = data;
+                }
                 public byte[] getBytes()
                 {
                     return data;
                 }
             }
         }
+        */
+        public abstract class NetProtocol
+        {
+            private _ReceiveData ReceiveCallback;
+            public int ProtocolNum { get; private set; }
+            public abstract void Reveive(byte[] data);
+            public abstract byte[] getBytes(byte[] data);
+        }
 
-        class ReceiveProc
+        public class ApplicaionProtocol
+        {
+            
+        }
+
+        public class PingerProtocol
+        {
+
+        }
+
+        public class ProtocolManager
+        {
+            private ConcurrentDictionary<int, NetProtocol> Protocols;
+            public void AddProtocol(NetProtocol pro)
+            {
+                Protocols.TryAdd(pro.ProtocolNum, pro);
+            }
+            public bool Send(byte[] data,int protocolNum,TCPCilent client)
+            {
+                byte[] protNum = BitConverter.GetBytes(protocolNum);
+
+                MemoryStream ms = new MemoryStream();
+                ms.Write(protNum, 0, protNum.Length);
+                ms.Write(data, 0, data.Length);
+                return client.Send(ms.ToArray());
+            }
+
+            private void ReveiceCallback(byte[] data,TcpClient client)
+            {
+                MemoryStream ms = new MemoryStream();
+                ms.Write(data, 0, data.Length);
+
+                int prtNum = BitConverter.ToInt32(ms.GetBuffer(),0);
+                ms.Seek(4, SeekOrigin.Begin);
+
+                byte[] prtData = new byte[ms.Length - ms.Position];
+                ms.Read(prtData, 0, prtData.Length);
+
+                if (!Protocols.ContainsKey(prtNum))
+                {
+                    return;
+                }
+
+                Protocols[prtNum].Reveive(prtData);
+            }
+            
+            class ProtocolMsg
+            {
+                public int ProtocolNum;
+                public byte[] data;
+            }
+        }
+
+        public class ReceiveProc
         { 
 
             private ManualResetEvent StopEvent;
@@ -615,7 +741,7 @@ namespace Network
         }
     }
 
-    class NetMsg
+    public class NetMsg
     {
         private Int32 DataLength;
         private byte[] Data;
