@@ -13,13 +13,46 @@ using System.Collections.Concurrent;
 
 using Network.TCP;
 using Network.UDP;
+using Network.Protocol;
 
 namespace Network
 {
     class Program
     {
+        private static ProtocolManager prtMgr;
+        private static TCPServer server;
+        private static TCPCilent client;
+        private static Timer PingTimer;
+
+        static void PingSend(object state)
+        {
+            if (server != null)
+            {
+                PingerProtocol.PingerMsg msg = new PingerProtocol.PingerMsg();
+                prtMgr.Send(msg, PingerProtocol.ProtocolNum, server);
+            }else if(client != null)
+            {
+                PingerProtocol.PingerMsg msg = new PingerProtocol.PingerMsg();
+                prtMgr.Send(msg, PingerProtocol.ProtocolNum, client);
+            }
+
+        }
+
+        static void ServerPingFiled(TCPCilent client)
+        {
+            Console.WriteLine(String.Format("Pingの送信に失敗 切断を確認  {0} : {1}", client.Ip, client.Port));
+        }
+
         static void Main(string[] args)
         {
+            prtMgr = new ProtocolManager();
+            PingerProtocol pingPro = new PingerProtocol();
+            ApplicaionProtocol appPro = new ApplicaionProtocol();
+            appPro.ReceiveCallback += AppCallback;
+
+            prtMgr.AddProtocol(pingPro);
+            prtMgr.AddProtocol(appPro);
+
             string str = Console.ReadLine();
             if (str.Equals("Client"))
             {
@@ -34,6 +67,11 @@ namespace Network
             return;
         }
 
+        public static void AppCallback(ApplicaionProtocol.AppMsg msg)
+        {
+            Console.WriteLine("AppMsgを受信 : " + Encoding.UTF8.GetString(msg.data));
+        }
+
         public static void TCPClientProc()
         {
             Console.Write("ServerIP : ");
@@ -43,9 +81,26 @@ namespace Network
 
             _ReceiveData callback = TCPClientCallback;
 
-            PingClient client = new PingClient(ip, int.Parse(port),1024,callback,1000);
-            client.PingStart(); 
+            client = new TCPCilent(ip, int.Parse(port),1024,callback);
+            client.OnConnectSuccess += remote =>
+            {
+                Console.WriteLine("接続しました。");
+            };
+            client.OnConnectFailed += (_ip, _port, _error) =>
+            {
+                Console.WriteLine(String.Format("接続が失敗しました。 IP:{0} PORT:{1} ERROR:{2}", _ip, _port, _error));
+            };
+            client.OnDisconnect += remote =>
+            {
+                Console.WriteLine("切断されました。");
+                PingTimer.Dispose();
+            };
+
+            client.Connect();
+
             client.ReceiveStart();
+
+            PingTimer = new Timer(PingSend,null,0,1000);
 
             while (true)
             {
@@ -54,20 +109,17 @@ namespace Network
                 {
                     break;
                 }
-                client.Send(Encoding.UTF8.GetBytes(str));
+                ApplicaionProtocol.AppMsg msg = new ApplicaionProtocol.AppMsg();
+                msg.data = Encoding.UTF8.GetBytes(str);
+                prtMgr.Send(msg, ApplicaionProtocol.ProtocolNum, client);
             }
-            Console.WriteLine("END...");
-            client.Close();
-        }
 
-        public static void TCPClientCallback(byte[] data,TcpClient client)
-        {
-            BinaryFormatter formatter = new BinaryFormatter();
-            MemoryStream ms = new MemoryStream();
-            ms.Write(data, 0, data.Length);
-            PingMsg formatter.Deserialize(ms);
-            string str = Encoding.UTF8.GetString(data);
-            Console.WriteLine("受信 : "+str);
+            Console.WriteLine("END...");
+            PingTimer.Dispose();
+            client.Close();
+            Console.WriteLine("END");
+            Console.ReadLine();
+
         }
 
         public static void TCPServerProc()
@@ -79,12 +131,29 @@ namespace Network
 
             _ReceiveData callback = TCPClientCallback;
 
-            TCPServer server = new TCPServer(ip, int.Parse(port),callback);
+            server = new TCPServer(ip, int.Parse(port));
+            server.OnConnectSuccess += remote =>
+            {
+                IPEndPoint endPint = remote;
+                Console.WriteLine(String.Format("接続を確認 {0} : {1}", endPint.Address, endPint.Port));
+            };
+            server.OnDisconnect += remote =>
+            {
+                IPEndPoint endPint = remote;
+                Console.WriteLine(String.Format("切断を確認 {0} : {1}", endPint.Address, endPint.Port));
+            };
+            server.DataReceiveCallback += TCPClientCallback;
             server.StartListener();
-            Console.WriteLine("受付開始");
+
+            PingTimer = new Timer(PingSend, null, 0, 1000);
+
+            Console.WriteLine("鯖開始");
+
             Console.ReadLine();
-            server.StopListener();
-            Console.WriteLine("受付終了");
+            PingTimer.Dispose();
+            server.StopServer();
+            Console.WriteLine("鯖終了");
+            Console.ReadLine();
         }
 
         public static void UDPProc()
@@ -136,6 +205,11 @@ namespace Network
             } while (true);
 
             udp.Close();
+        }
+
+        public static void TCPClientCallback(byte[] data, TcpClient client)
+        {
+            prtMgr.divide(data, client);
         }
     }
 
@@ -292,24 +366,38 @@ namespace Network
     {
         public delegate void _ReceiveData(byte[] data, TcpClient remote);
 
-        public class TCPServer
+        public delegate void _OnConnectSuccess(IPEndPoint remote);
+        public delegate void _OnDisconnect(IPEndPoint remote);
+        public delegate void _OnConnectFailed(string ip,int port,int errorCode);
+
+        public class TCPBase
         {
+            public _OnConnectSuccess OnConnectSuccess;
+            public _OnDisconnect OnDisconnect;
+            public _OnConnectFailed OnConnectFailed;
+
+            protected int ReadTimeOut = -1;
+            protected int WriteTimeOut = -1;
+        }
+
+        public class TCPServer : TCPBase
+        {
+            public _ReceiveData DataReceiveCallback;
+            public bool ServerEnabled { get; private set; }
+            public bool ListenEnabled { get; private set; }
+
             private ManualResetEvent ListenStoper;
             private ManualResetEvent ReceiveStoper;
 
             private IPAddress ListenAddress;
             private int Port;
             private TcpListener Listener;
-            private _ReceiveData DataReceiveCallback;
 
-            private ConcurrentDictionary<string, ReceiveProc> Clients;
+            private ConcurrentDictionary<string, TCPCilent> Clients;
 
             private object locker;
 
-            private int ReadTimeOut = -1;
-            private int WriteTimeOut = -1;
-
-            public TCPServer(string ip,int port,_ReceiveData callback)
+            public TCPServer(string ip,int port)
             {
                 ListenStoper = new ManualResetEvent(false);
                 ReceiveStoper = new ManualResetEvent(false);
@@ -317,15 +405,21 @@ namespace Network
                 ListenAddress = IPAddress.Parse(ip);
                 Port = port;
                 Listener = new TcpListener(ListenAddress, Port);
-                Clients = new ConcurrentDictionary<string, ReceiveProc>();
-
-                DataReceiveCallback = callback;
+                Clients = new ConcurrentDictionary<string, TCPCilent>();
 
                 locker = new object();
+
+                ServerEnabled = false;
+                ListenEnabled = false;
             }
 
             public void StartListener()
             {
+                if (ListenEnabled || ServerEnabled)
+                    return;
+                ListenEnabled = true;
+                ServerEnabled = true;
+                ListenStoper.Reset();
                 if (Listener == null)
                     return;
                 Listener.Start();
@@ -334,10 +428,29 @@ namespace Network
 
             public void StopListener()
             {
+                if (!ListenEnabled)
+                    return;
+                ListenEnabled = false;
                 if (Listener == null)
                     return;
                 Listener.Stop();
                 ListenStoper.WaitOne();
+            }
+
+            public void StopServer()
+            {
+                if (!ServerEnabled)
+                    return;
+                ServerEnabled = false;
+                StopListener();
+                lock(locker)
+                {
+                    foreach(TCPCilent proc in Clients.Values)
+                    {
+                        proc.Close();
+                    }
+                    Clients.Clear();
+                }
             }
 
             private void ListenCallback(IAsyncResult ar)
@@ -359,15 +472,19 @@ namespace Network
                     }
                 }
 
-                Console.WriteLine("接続を確認");
+                if (OnConnectSuccess != null)
+                    OnConnectSuccess.Invoke((IPEndPoint)client.Client.RemoteEndPoint);
 
                 IPEndPoint endPoint = (IPEndPoint)client.Client.RemoteEndPoint;
                 string key = endPoint.Address.ToString() + endPoint.Port.ToString();
 
                 ReceiveProc proc = new ReceiveProc(ReadTimeOut, WriteTimeOut, client, 1024);
 
-                Clients.TryAdd(key, proc);
+                TCPCilent _client = new TCPCilent(proc);
+
+                Clients.TryAdd(key, _client);
                 proc.ReceiveDataCallback = DataReceiveCallback;
+                proc.OnDisconnect = OnDisconnect;
                 proc.ReceiveStart();
 
                 Listener.BeginAcceptTcpClient(ListenCallback, listener);
@@ -376,72 +493,149 @@ namespace Network
             public bool Send(string ip,int port,byte[] data)
             {
                 ip += port;
-                NetMsg msg = new NetMsg(data);
                 bool result = false;
                 lock (locker)
                 {
-                    result = Clients[ip].Send(msg);
+                    if (Clients.ContainsKey(ip))
+                    {
+                        result = Clients[ip].Send(data);
+                        if (!result)
+                        {
+                            TCPCilent proc;
+                            if(!Clients.TryRemove(ip,out proc))
+                            {
+                                Console.WriteLine(ip + "の削除に失敗");
+                            }
+                        }
+                    }
                 }
                 return result;
             }
 
             public void SendAll(byte[] data)
             {
-                NetMsg msg = new NetMsg(data);
+                List<TCPCilent> list = new List<TCPCilent>();
                 lock (locker)
                 {
-                    foreach (ReceiveProc proc in Clients.Values)
+                    foreach (TCPCilent proc in Clients.Values)
                     {
-                        proc.Send(msg);
+                        if (!proc.Send(data))
+                        {
+                            list.Add(proc);
+                        }
+                    }
+                    for(int n = 0;n < list.Count;n++)
+                    {
+                        TCPCilent p;
+                        if(!Clients.TryRemove(list[n].getKey(),out p))
+                        {
+                            Console.WriteLine(list[n].getKey() + "の削除に失敗");
+                        }
                     }
                 }
             }
+
+            public ICollection<TCPCilent> getClients()
+            {
+                return Clients.Values;
+            }
         }
 
-        public class TCPCilent
+        public class TCPCilent : TCPBase
         {
             private ReceiveProc RecvProc;
-            private int ReadTimeOut = -1;
-            private int WriteTimeOut = -1;
-
-            public TCPCilent(string ip,int port,int buffer,_ReceiveData ReceiveCallback):this(ip,port,buffer)
+            public string Ip { get; private set; }
+            public int Port
             {
-                RecvProc.ReceiveDataCallback = ReceiveCallback;
+                get; private set;
+            }
+            private _ReceiveData ReceiveCallback;
+            private int BufferSize;
+            
+            public bool Connected
+            {
+                get
+                {
+                    if (RecvProc == null)
+                        return false;
+                    return RecvProc.Connected;
+                }
+            }
+
+            public TCPCilent(string ip,int port,int buffer,_ReceiveData receiveCallback):this(ip,port,buffer)
+            {
+                ReceiveCallback = receiveCallback;
             }
             
             protected TCPCilent(string ip,int port,int buffer)
             {
+                BufferSize = buffer;
+                Ip = ip;
+                Port = port;
+            }
+
+            internal TCPCilent(ReceiveProc proc)
+            {
+                RecvProc = proc;
+                Ip = proc.Remote.Address.ToString();
+                Port = proc.Remote.Port;
+                ReceiveCallback = proc.ReceiveDataCallback;
+                BufferSize = proc.BufferSize;
+            }
+
+            public void Connect()
+            {
+                if (RecvProc != null)
+                    return;
                 TcpClient client;
                 try
                 {
-                    client = new TcpClient(ip, port);
+                    client = new TcpClient(Ip,Port);
                 }
                 catch (SocketException e)
                 {
-                    Console.WriteLine("接続に失敗しました");
-                    Console.WriteLine("ErrorCode : " + e.ErrorCode);
+                    if (OnConnectFailed != null)
+                        OnConnectFailed.Invoke(Ip, Port, e.ErrorCode);
                     return;
                 }
-                Console.WriteLine("接続完了");
                 RecvProc = new ReceiveProc(ReadTimeOut, WriteTimeOut, client, 1024);
+                RecvProc.ReceiveDataCallback = ReceiveCallback;
+                RecvProc.OnDisconnect = OnDisconnect;
+                if (OnConnectSuccess != null)
+                    OnConnectSuccess.Invoke((IPEndPoint)RecvProc.getRemote().Client.RemoteEndPoint);
+            }
+
+            public string getKey()
+            {
+                if (RecvProc == null)
+                    return null;
+                return RecvProc.getKey();
             }
 
             public virtual bool Send(byte[] data)
             {
+                if (RecvProc == null)
+                    return false; ;
                 NetMsg msg = new NetMsg(data);
-                return RecvProc.Send(msg);
+                bool result = RecvProc.Send(msg);
+                return result;
             }
             public virtual void ReceiveStart()
             {
+                if (RecvProc == null)
+                    return;
                 RecvProc.ReceiveStart();
             }
             public virtual void ReceiveEnd()
             {
                 RecvProc.ReceiveEnd();
+                RecvProc = null;
             }
+            
             public void Close()
             {
                 RecvProc.Close();
+                RecvProc = null;
             }
 
             protected void setReceveCallback(_ReceiveData callback)
@@ -460,175 +654,43 @@ namespace Network
             }
         }
 
-        /*
-        public class PingClient : TCPCilent
-        {
-            private int PingInterval;
-            private _ReceiveData ReceiveCallback;
-            private Timer PingTimer;
-            private byte[] dummy;
-            private BinaryFormatter formatter;
-
-            public PingClient(string ip,int port,int buffer,_ReceiveData ReceiveCallback,int pingInterval) : base(ip, port, buffer)
-            {
-                setReceveCallback(PingCallback);
-                PingInterval = pingInterval;
-                this.ReceiveCallback = ReceiveCallback;
-                dummy = new byte[0];
-                formatter = new BinaryFormatter();
-            }
-            public void PingStart()
-            {
-                PingTimer = new Timer(new TimerCallback(PingSendCallback));
-                PingTimer.Change(0, PingInterval);
-            }
-            public void PingStop()
-            {
-                PingTimer.Dispose();
-            }
-            public override bool Send(byte[] data)
-            {
-                PingMsg ping = new PingMsg(data);
-                NetMsg msg = new NetMsg(ping.getBytes());
-                return getReceiveProc().Send(msg);
-            }
-
-            public override void ReceiveEnd()
-            {
-                PingTimer.Dispose();
-                PingTimer = null;
-                base.ReceiveEnd();
-            }
-
-            private void PingSendCallback(object args)
-            {
-                PingMsg ping = new PingMsg(dummy);
-                using (MemoryStream ms = new MemoryStream())
-                {
-                    formatter.Serialize(ms, ping);
-                    NetMsg msg = new NetMsg(ms.ToArray());
-                    Send(msg.getBytes());
-                }
-            }
-
-            private void PingCallback(byte[] data,TcpClient remote)
-            {
-                BinaryFormatter formatter = new BinaryFormatter();
-                MemoryStream ms = new MemoryStream();
-                ms.Write(data, 0, data.Length);
-                PingMsg msg;
-
-                try {
-                    msg = (PingMsg)formatter.Deserialize(ms);
-                }
-                catch (Exception)
-                {
-                    return;
-                }
-
-                Console.WriteLine("PINGを受信");
-
-                if (ReceiveCallback != null)
-                {
-                    ReceiveCallback.Invoke(msg.getBytes(), remote);
-                }
-            }
-
-            [System.Serializable]
-            class PingMsg
-            {
-                private byte[] data;
-                public PingMsg(byte[] data)
-                {
-                    this.data = data;
-                }
-                public byte[] getBytes()
-                {
-                    return data;
-                }
-            }
-        }
-        */
-        public abstract class NetProtocol
-        {
-            private _ReceiveData ReceiveCallback;
-            public int ProtocolNum { get; private set; }
-            public abstract void Reveive(byte[] data);
-            public abstract byte[] getBytes(byte[] data);
-        }
-
-        public class ApplicaionProtocol
-        {
-            
-        }
-
-        public class PingerProtocol
-        {
-
-        }
-
-        public class ProtocolManager
-        {
-            private ConcurrentDictionary<int, NetProtocol> Protocols;
-            public void AddProtocol(NetProtocol pro)
-            {
-                Protocols.TryAdd(pro.ProtocolNum, pro);
-            }
-            public bool Send(byte[] data,int protocolNum,TCPCilent client)
-            {
-                byte[] protNum = BitConverter.GetBytes(protocolNum);
-
-                MemoryStream ms = new MemoryStream();
-                ms.Write(protNum, 0, protNum.Length);
-                ms.Write(data, 0, data.Length);
-                return client.Send(ms.ToArray());
-            }
-
-            private void ReveiceCallback(byte[] data,TcpClient client)
-            {
-                MemoryStream ms = new MemoryStream();
-                ms.Write(data, 0, data.Length);
-
-                int prtNum = BitConverter.ToInt32(ms.GetBuffer(),0);
-                ms.Seek(4, SeekOrigin.Begin);
-
-                byte[] prtData = new byte[ms.Length - ms.Position];
-                ms.Read(prtData, 0, prtData.Length);
-
-                if (!Protocols.ContainsKey(prtNum))
-                {
-                    return;
-                }
-
-                Protocols[prtNum].Reveive(prtData);
-            }
-            
-            class ProtocolMsg
-            {
-                public int ProtocolNum;
-                public byte[] data;
-            }
-        }
-
         public class ReceiveProc
-        { 
+        {
+            public IPEndPoint Remote { get; private set; }
+            public int BufferSize
+            {
+                get
+                {
+                    if (Buffer == null)
+                        return 0;
+                    return Buffer.Length;
+                }
+            }
 
             private ManualResetEvent StopEvent;
             private MemoryStream MemoryStream;
             private TcpClient Client;
             private byte[] Buffer;
+            public bool Connected { get; private set; }
             public _ReceiveData ReceiveDataCallback;
+            public _OnDisconnect OnDisconnect;
 
             public ReceiveProc(int readTimeout, int writeTimeout, TcpClient client, int buffer)
             {
                 Client = client;
+                Remote = (IPEndPoint)Client.Client.RemoteEndPoint;
                 Client.GetStream().ReadTimeout = readTimeout;
                 Client.GetStream().WriteTimeout = writeTimeout;
 
                 this.MemoryStream = new MemoryStream();
 
                 Buffer = new byte[buffer];
+                Connected = true;
 
+            }
+            public TcpClient getRemote()
+            {
+                return Client;
             }
             public bool Send(NetMsg msg)
             {
@@ -637,12 +699,23 @@ namespace Network
                     Client.GetStream().Write(data, 0, data.Length);
                 }catch(IOException)
                 {
-                    Console.WriteLine("送信に失敗しました。切断されている可能性があります");
+                    Connected = false;
+                    if (OnDisconnect != null)
+                        OnDisconnect.Invoke(Remote);
                     return false;
                 }
                 catch (SocketException)
                 {
-                    Console.WriteLine("送信に失敗しました。切断されている可能性があります");
+                    Connected = false;
+                    if (OnDisconnect != null)
+                        OnDisconnect.Invoke(Remote);
+                    return false;
+                }
+                catch (InvalidOperationException)
+                {
+                    Connected = false;
+                    if (OnDisconnect != null)
+                        OnDisconnect.Invoke(Remote);
                     return false;
                 }
                 return true;
@@ -654,13 +727,27 @@ namespace Network
             }
             public void ReceiveEnd()
             {
-                Client.GetStream().Dispose();
+                try
+                {
+                    Client.GetStream().Dispose();
+                }
+                catch (InvalidOperationException)
+                {
+
+                }
+
                 StopEvent.WaitOne();
             }
             public void Close()
             {
                 ReceiveEnd();
                 Client.Close();
+            }
+
+            public string getKey()
+            {
+                IPEndPoint ip = (IPEndPoint)Client.Client.RemoteEndPoint;
+                return ip.Address.ToString() + ip.Port;
             }
 
             private void ReceiveCallBack(IAsyncResult ar)
@@ -670,13 +757,38 @@ namespace Network
                 {
                     byteCount = Client.GetStream().EndRead(ar);
                 }
-                catch (ObjectDisposedException e)
+                catch (ObjectDisposedException)
                 {
+                    Connected = false;
+                    if (OnDisconnect != null)
+                        OnDisconnect.Invoke(Remote);
                     StopEvent.Set();
+                    return;
                 }
-                catch (SocketException e)
+                catch (SocketException)
                 {
+                    Connected = false;
+                    if (OnDisconnect != null)
+                        OnDisconnect.Invoke(Remote);
                     StopEvent.Set();
+                    return;
+
+                }
+                catch(InvalidOperationException)
+                {
+                    Connected = false;
+                    if (OnDisconnect != null)
+                        OnDisconnect.Invoke(Remote);
+                    StopEvent.Set();
+                    return;
+                }
+                catch (IOException)
+                {
+                    Connected = false;
+                    if (OnDisconnect != null)
+                        OnDisconnect.Invoke(Remote);
+                    StopEvent.Set();
+                    return;
                 }
 
                 MemoryStream.Write(Buffer, 0, byteCount);
@@ -729,14 +841,204 @@ namespace Network
                 {
                     Client.GetStream().BeginRead(Buffer, 0, Buffer.Length, ReceiveCallBack, null);
                 }
-                catch (ObjectDisposedException e)
+                catch (ObjectDisposedException)
                 {
+                    Connected = false;
+                    if (OnDisconnect != null)
+                        OnDisconnect.Invoke(Remote);
                     StopEvent.Set();
                 }
-                catch (SocketException e)
+                catch (SocketException)
                 {
+                    Connected = false;
+                    if (OnDisconnect != null)
+                        OnDisconnect.Invoke(Remote);
                     StopEvent.Set();
                 }
+                catch(IOException)
+                {
+                    Connected = false;
+                    if (OnDisconnect != null)
+                        OnDisconnect.Invoke(Remote);
+                    StopEvent.Set();
+                }
+            }
+        }
+    }
+
+    namespace Protocol
+    {
+        public abstract class NetProtocol
+        {
+            public const int ProtocolNum = 0;
+            private _ReceiveData ReceiveCallback;
+            private BinaryFormatter formatter;
+            public NetProtocol()
+            {
+                formatter = new BinaryFormatter();
+            }
+            public abstract void Reveive(byte[] data,TcpClient client);
+            public byte[] getBytes(object obj)
+            {
+                MemoryStream ms = new MemoryStream();
+                formatter.Serialize(ms, obj);
+                return ms.ToArray();
+            }
+            public abstract byte[] getBytes(byte[] data);
+            public abstract int getProtocolNum();
+        }
+
+        public class ApplicaionProtocol : NetProtocol
+        {
+            public delegate void _ReceiveCallback(AppMsg msg);
+
+            public new const int ProtocolNum = 1; 
+            private BinaryFormatter formatter;
+
+            public _ReceiveCallback ReceiveCallback;
+
+            public ApplicaionProtocol()
+            {
+                formatter = new BinaryFormatter();
+            }
+            public override byte[] getBytes(byte[] data)
+            {
+                AppMsg msg = new AppMsg();
+                msg.data = data;
+
+                return getBytes(msg);
+            }
+
+            public override int getProtocolNum()
+            {
+                return ProtocolNum;
+            }
+
+            public override void Reveive(byte[] data, TcpClient client)
+            {
+                MemoryStream ms = new MemoryStream();
+                ms.Write(data, 0, data.Length);
+                ms.Seek(0, SeekOrigin.Begin);
+                AppMsg msg = (AppMsg)formatter.Deserialize(ms);
+                if(ReceiveCallback != null)
+                {
+                    ReceiveCallback.Invoke(msg);
+                }
+            }
+
+            [Serializable]
+            public class AppMsg
+            {
+                public byte[] data;
+            }
+        }
+
+        public class PingerProtocol : NetProtocol
+        {
+            public new const int ProtocolNum = -1;
+            private BinaryFormatter formatter;
+            public PingerProtocol()
+            {
+                formatter = new BinaryFormatter();
+            }
+            public override int getProtocolNum()
+            {
+                return ProtocolNum;
+            }
+            public override void Reveive(byte[] data,TcpClient client)
+            {
+                Console.WriteLine("Ping受信 : "+client.Client.RemoteEndPoint.ToString());
+            }
+            public override byte[] getBytes(byte[] data)
+            {
+                PingerMsg ping = new PingerMsg();
+                return getBytes(ping);
+            }
+
+            [Serializable]
+            public class PingerMsg
+            {
+
+            }
+        }
+
+        public class ProtocolManager
+        {
+            public delegate void _SendFailed(TCPCilent client);
+            private ConcurrentDictionary<int, NetProtocol> Protocols;
+            public ProtocolManager()
+            {
+                Protocols = new ConcurrentDictionary<int, NetProtocol>();
+            }
+            public void AddProtocol(NetProtocol pro)
+            {
+                Protocols.TryAdd(pro.getProtocolNum(), pro);
+            }
+            public bool Send(object obj, int protocolNum, TCPCilent client)
+            {
+                byte[] protNum = BitConverter.GetBytes(protocolNum);
+                byte[] data = Protocols[protocolNum].getBytes(obj);
+
+                MemoryStream ms = new MemoryStream();
+
+                ms.Write(protNum, 0, protNum.Length);
+                
+                ms.Write(data, 0, data.Length);
+
+                return client.Send(ms.ToArray());
+            }
+
+            public void SendAll(object obj,int protocolNum,ICollection<TCPCilent> clients,_SendFailed callback)
+            {
+                foreach (TCPCilent client in clients) {
+                    if(!Send(obj, protocolNum, client))
+                    {
+                        if(callback != null)
+                            callback.Invoke(client);
+                    }
+                }
+            }
+
+            public void Send(object obj, int protocolNum, TCPServer server)
+            {
+                byte[] protNum = BitConverter.GetBytes(protocolNum);
+                byte[] data = Protocols[protocolNum].getBytes(obj);
+
+                MemoryStream ms = new MemoryStream();
+
+                ms.Write(protNum, 0, protNum.Length);
+
+                ms.Write(data, 0, data.Length);
+
+                server.SendAll(ms.ToArray());
+            }
+
+            public void divide(byte[] data, TcpClient client)
+            {
+                MemoryStream ms = new MemoryStream();
+                ms.Write(data, 0, data.Length);
+
+                //先頭4バイトからプロトコル番号を取得
+                int prtNum = BitConverter.ToInt32(ms.GetBuffer(), 0);
+                ms.Seek(4, SeekOrigin.Begin);
+
+                //データを分離
+                byte[] prtData = new byte[ms.Length - ms.Position];
+                ms.Read(prtData, 0, prtData.Length);
+
+                if (!Protocols.ContainsKey(prtNum))
+                {
+                    return;
+                }
+
+                //データをプロトコルで解析、各プロトコルのコールバックが呼ばれる
+                Protocols[prtNum].Reveive(prtData,client);
+            }
+
+            class ProtocolMsg
+            {
+                public int ProtocolNum;
+                public byte[] data;
             }
         }
     }
